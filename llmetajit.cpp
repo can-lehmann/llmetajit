@@ -19,11 +19,14 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/IRReader/IRReader.h"
 #include "llvm/Transforms/Utils/ValueMapper.h"
-#include "llvm/ExecutionEngine/MCJIT.h"
-#include "llvm/Support/DynamicLibrary.h"
+#include "llvm/ExecutionEngine/Orc/ThreadSafeModule.h"
+#include "llvm/ExecutionEngine/Orc/LLJIT.h"
+#include "llvm/Support/Error.h"
+#include "llvm/Support/TargetSelect.h"
 
 #include "llvm-c/Core.h"
 
@@ -166,6 +169,20 @@ namespace llmetajit {
             get_bool(false)
           }
         );
+      } else if (StructType* struct_type = dyn_cast<StructType>(type)) {
+        std::vector<Value*> elements;
+        for (Type* element : struct_type->elements()) {
+          elements.push_back(emit_type(element));
+        }
+        return builder.CreateCall(
+          llvm_api.StructTypeInContext,
+          {
+            get_context(),
+            get_ptr_array(elements),
+            get_u((unsigned)elements.size()),
+            get_bool(struct_type->isPacked())
+          }
+        );
       } else {
         type->print(errs());
         assert(false);
@@ -253,7 +270,7 @@ namespace llmetajit {
           llvm_api.BuildGEP2,
           {
             get_builder(),
-            emit_type(gep->getPointerOperandType()),
+            emit_type(gep->getSourceElementType()),
             emit_arg(gep->getPointerOperand()),
             get_ptr_array(indices),
             get_u((unsigned)gep->getNumIndices()),
@@ -265,7 +282,7 @@ namespace llmetajit {
           llvm_api.BuildCast,
           {
             get_builder(),
-            get_u((unsigned)cast->getOpcode()),
+            get_u((unsigned)LLVMGetInstructionOpcode(wrap(cast))),
             emit_arg(cast->getOperand(0)),
             emit_type(cast->getDestTy()),
             get_str("")
@@ -287,7 +304,7 @@ namespace llmetajit {
           llvm_api.BuildBinOp,
           {
             get_builder(),
-            get_u((unsigned)binop->getOpcode()),
+            get_u((unsigned)LLVMGetInstructionOpcode(wrap(binop))), // C-API Opcodes are different from C++ API Opcodes!
             emit_arg(binop->getOperand(0)),
             emit_arg(binop->getOperand(1)),
             get_str("")
@@ -327,7 +344,8 @@ namespace llmetajit {
               llvm_api.BuildGuard,
               {
                 get_builder(),
-                emit_arg(branch->getCondition())
+                emit_arg(branch->getCondition()),
+                builder.CreateZExt(vmap[branch->getCondition()], Type::getInt32Ty(context))
               }
             );
           }
@@ -365,13 +383,17 @@ namespace llmetajit {
   };
 }
 
-LLVMValueRef LLVMBuildGuard(LLVMBuilderRef builder_ref, LLVMValueRef cond_ref) {
+LLVMValueRef LLVMBuildGuard(LLVMBuilderRef builder_ref, LLVMValueRef cond_ref, LLVMBool cond_value) {
   IRBuilder<>* builder = unwrap(builder_ref);
   LLVMContext& context = builder->getContext();
   Function* function = builder->GetInsertBlock()->getParent();
   BasicBlock* success = BasicBlock::Create(context, "guard_success", function);
   BasicBlock* fail = BasicBlock::Create(context, "guard_fail", function);
-  BranchInst* branch = builder->CreateCondBr(unwrap(cond_ref), success, fail);
+  Value* cond = unwrap(cond_ref);
+  if (!cond_value) {
+    cond = builder->CreateNot(cond);
+  }
+  BranchInst* branch = builder->CreateCondBr(cond, success, fail);
   builder->SetInsertPoint(fail);
   builder->CreateRet(nullptr);
   builder->SetInsertPoint(success);
@@ -386,10 +408,27 @@ void output(uint8_t x) {
   outs() << (int)x << '\n';
 }
 
+void optimize(Module& module, OptimizationLevel level = OptimizationLevel::O3) {
+  LoopAnalysisManager lam;
+  FunctionAnalysisManager fam;
+  CGSCCAnalysisManager cgam;
+  ModuleAnalysisManager mam;
+
+  PassBuilder pass_builder;
+  pass_builder.registerModuleAnalyses(mam);
+  pass_builder.registerFunctionAnalyses(fam);
+  pass_builder.registerLoopAnalyses(lam);
+  pass_builder.registerCGSCCAnalyses(cgam);
+  pass_builder.crossRegisterProxies(lam, fam, cgam, mam);
+
+  ModulePassManager mpm = pass_builder.buildPerModuleDefaultPipeline(level);
+  mpm.run(module, mam);
+}
+
 int main(int argc, const char** argv) {
-  LLVMInitializeNativeTarget();
-  LLVMInitializeNativeAsmPrinter();
-  LLVMInitializeNativeAsmParser();
+  llvm::InitializeNativeTarget();
+  llvm::InitializeNativeTargetAsmPrinter();
+  llvm::InitializeNativeTargetAsmParser();
 
   SMDiagnostic diagnostic;
   std::string error;
@@ -406,7 +445,7 @@ int main(int argc, const char** argv) {
       PointerType::get(context, 0), // function
       PointerType::get(context, 0), // module
     }, false),
-    GlobalValue::InternalLinkage,
+    GlobalValue::ExternalLinkage,
     "trace",
     module.get()
   );
@@ -421,21 +460,20 @@ int main(int argc, const char** argv) {
   }
 
   {
-    Module* module2 = module.get();
-    ExecutionEngine* mcjit = EngineBuilder(std::move(module))
-      .setEngineKind(EngineKind::JIT)
-      .setErrorStr(&error)
-      .create();
+    ExitOnError ExitOnErr;
+    using namespace llvm::orc;
+    std::unique_ptr<LLJIT> jit = ExitOnErr(LLJITBuilder().create());
 
-    if (!mcjit) {
-      errs() << error;
-      return 1;
-    }
+    SymbolMap symbol_map;
 
     #define map(name) { \
-      Function* function = module2->getFunction(#name); \
-      assert(function); \
-      mcjit->addGlobalMapping(function, (void*)&name); \
+      symbol_map.insert({ \
+        jit->mangleAndIntern(#name), \
+        ExecutorSymbolDef( \
+          ExecutorAddr((uint64_t)(void*)(&name)), \
+          JITSymbolFlags::Callable \
+        ) \
+      }); \
     }
 
     //map(debug)
@@ -448,26 +486,42 @@ int main(int argc, const char** argv) {
 
     #undef map
 
-    mcjit->finalizeObject();
+    JITDylib& dylib = jit->getMainJITDylib();
+    ExitOnErr(dylib.define(absoluteSymbols(std::move(symbol_map))));
+
+    std::unique_ptr<Module> trace_module = std::make_unique<Module>("trace_module", context);
+    for (Function& function : *module) {
+      Function::Create(
+        function.getFunctionType(),
+        GlobalValue::ExternalLinkage,
+        function.getName(),
+        trace_module.get()
+      );
+    }
+
+    ThreadSafeModule tsm(std::move(module), std::make_unique<LLVMContext>());
+    ExitOnErr(jit->addIRModule(std::move(tsm)));
 
     using InitFn = void* (*)();
-    InitFn init = (InitFn)mcjit->getFunctionAddress("init");
     using StepFn = void (*)(void*);
-    StepFn step = (StepFn)mcjit->getFunctionAddress("step");
     using TraceFn = void (*)(void*, LLVMBuilderRef, LLVMContextRef, LLVMValueRef, LLVMModuleRef);
-    TraceFn trace = (TraceFn)mcjit->getFunctionAddress("trace");
+
+    InitFn init = ExitOnErr(jit->lookup("init")).toPtr<InitFn>();
+    StepFn step = ExitOnErr(jit->lookup("step")).toPtr<StepFn>();
+    TraceFn trace = ExitOnErr(jit->lookup("trace")).toPtr<TraceFn>();
 
     {
       void* state = init();
       //step(state);
 
+
       Function* my_trace = Function::Create(
         FunctionType::get(Type::getVoidTy(context), {
           PointerType::get(context, 0),
         }, false),
-        GlobalValue::InternalLinkage,
+        GlobalValue::ExternalLinkage,
         "my_trace",
-        module2
+        trace_module.get()
       );
 
       BasicBlock* entry = BasicBlock::Create(context, "entry", my_trace);
@@ -476,20 +530,27 @@ int main(int argc, const char** argv) {
       builder.SetInsertPoint(entry);
 
       for (size_t it = 0; it < 30; it++) {
-        trace(state, wrap(&builder), wrap(&context), wrap(my_trace), wrap(module2));
+        trace(state, wrap(&builder), wrap(&context), wrap(my_trace), wrap(trace_module.get()));
       }
       builder.CreateRet(nullptr);
-      my_trace->print(outs());
+
+      optimize(*trace_module);
+      trace_module->print(outs(), nullptr);
+
+      if (verifyModule(*trace_module, &errs())) {
+        return 1;
+      }
+
+      ExitOnErr(jit->addIRModule(ThreadSafeModule(std::move(trace_module), std::make_unique<LLVMContext>())));
     }
 
-    mcjit->finalizeObject();
-
     {
-      StepFn my_trace = (StepFn)mcjit->getFunctionAddress("my_trace");
-      assert(my_trace);
+      outs() << "Run trace\n";
+      StepFn my_trace = ExitOnErr(jit->lookup("my_trace")).toPtr<StepFn>();
+
       void* state = init();
-      debug();
       my_trace(state);
+      outs() << "done\n";
     }
   }
 

@@ -8,5 +8,5 @@ bin/llmetajit: llmetajit.cpp
 
 examples/%.ll: examples/%.cpp
 	clang++ -Xclang -disable-O0-optnone -c -emit-llvm -S -o $@ $<
-	opt -passes=lower-switch -o $@ -S $@
+	opt -passes=lower-switch,instcombine,dce -o $@ -S $@
 

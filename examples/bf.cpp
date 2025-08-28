@@ -23,7 +23,7 @@ private:
   size_t pos = 0;
 public:
   Bf() {
-    code = "+++[>+++<-].>.";
+    code = ".+++[>+++<-].>.";
     while (code[code_size] != '\0') {
       code_size++;
     }
