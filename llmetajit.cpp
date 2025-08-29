@@ -19,6 +19,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/Passes/PassBuilder.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/IRReader/IRReader.h"
@@ -92,24 +93,73 @@ namespace llmetajit {
         builder(context) {
     }
 
-    Value* get_builder() {
-      return tracer->getArg(1);
+    Value* is_const_arg(Value* value) {
+      if (is_const.find(value) != is_const.end()) {
+        assert(is_const.at(value));
+        return is_const.at(value);
+      } else if (isa<Constant>(value)) {
+        return ConstantInt::getTrue(context);
+      } else {
+        // TODO
+        return ConstantInt::getFalse(context);
+      }
     }
 
-    Value* get_context() {
+    Value* is_const_ptr(Value* value) {
+      assert(value->getType()->isPointerTy());
+      Value* is_const = is_const_arg(value);
+      if (is_const->getType()->isPointerTy()) {
+        return is_const;
+      } else {
+        return ConstantPointerNull::get(cast<PointerType>(value->getType()));
+      }
+    }
+
+    Value* is_const_bool(Value* value) {
+      Value* is_const = is_const_arg(value);
+      if (PointerType* pointer_type = dyn_cast<PointerType>(is_const->getType())) {
+        return builder.CreateICmpNE(
+          is_const,
+          ConstantPointerNull::get(pointer_type)
+        );
+      } else {
+        IntegerType* integer_type = cast<IntegerType>(is_const->getType());
+        if (integer_type->getBitWidth() > 1) {
+          is_const = builder.CreateICmpEQ(
+            is_const,
+            ConstantInt::get(is_const->getType(), ~uint64_t(0), true)
+          );
+        }
+        return is_const;
+      }
+    }
+
+    Value* get_builder() {
       return tracer->getArg(2);
     }
 
-    Value* get_function() {
+    Value* get_context() {
       return tracer->getArg(3);
     }
 
-    Value* get_module() {
+    Value* get_function() {
       return tracer->getArg(4);
+    }
+
+    Value* get_module() {
+      return tracer->getArg(5);
     }
 
     Constant* get_null() {
       return ConstantPointerNull::get(PointerType::get(context, 0));
+    }
+
+    Value* get_vmap(Value* value) {
+      if (vmap.find(value) != vmap.end()) {
+        value = vmap[value];
+        assert(value);
+      }
+      return value;
     }
 
     Value* get_str(const std::string& str) {
@@ -189,6 +239,25 @@ namespace llmetajit {
       }
     }
 
+    Value* emit_constant_int(IntegerType* type, Value* value) {
+      size_t ull_width = sizeof(unsigned long long) * 8;
+      assert(type->getBitWidth() <= ull_width);
+
+      IntegerType* value_type = cast<IntegerType>(value->getType());
+      if (value_type->getBitWidth() != ull_width) {
+        value = builder.CreateZExtOrTrunc(value, Type::getIntNTy(context, ull_width));
+      }
+
+      return builder.CreateCall(
+        llvm_api.ConstInt,
+        {
+          emit_type(type),
+          value,
+          get_bool(false)
+        }
+      );
+    }
+
     Value* emit_arg(Value* value) {
       if (emitted.find(value) != emitted.end()) {
         return emitted.at(value);
@@ -198,14 +267,9 @@ namespace llmetajit {
           {get_function(), get_u((unsigned)arg->getArgNo())}
         );
       } else if (ConstantInt* constant_int = dyn_cast<ConstantInt>(value)) {
-        assert(constant_int->getBitWidth() <= sizeof(unsigned long long) * 8);
-        return builder.CreateCall(
-          llvm_api.ConstInt,
-          {
-            emit_type(constant_int->getType()),
-            get_u((unsigned long long)constant_int->getLimitedValue()),
-            get_bool(false)
-          }
+        return emit_constant_int(
+          cast<IntegerType>(constant_int->getType()),
+          get_u((unsigned long long)constant_int->getLimitedValue())
         );
       } else if (Function* function = dyn_cast<Function>(value)) {
         return builder.CreateCall(
@@ -240,13 +304,58 @@ namespace llmetajit {
       return array;
     }
 
+    template <class Fn>
+    Value* map_pointer_constness(Value* pointer, const Fn& fn, Type* res_type = nullptr) {
+      if (!isa<ConstantPointerNull>(pointer)) {
+        BasicBlock* block = builder.GetInsertBlock();
+        BasicBlock* then = BasicBlock::Create(context, "then", tracer);
+        BasicBlock* cont = BasicBlock::Create(context, "cont", tracer);
+
+        Value* is_null = builder.CreateICmpEQ(
+          pointer,
+          ConstantPointerNull::get(cast<PointerType>(pointer->getType()))
+        );
+        builder.CreateCondBr(is_null, cont, then);
+
+        builder.SetInsertPoint(then);
+        Value* value = fn();
+        builder.CreateBr(cont);
+
+        builder.SetInsertPoint(cont);
+        PHINode* phi = builder.CreatePHI(res_type, 2);
+        phi->addIncoming(value, then);
+        phi->addIncoming(Constant::getNullValue(res_type), block);
+
+        return phi;
+      } else if (res_type) {
+        return Constant::getNullValue(res_type);
+      } else {
+        return nullptr;
+      }
+    }
+
     Value* emit_inst(Instruction* inst) {
       if (AllocaInst* alloca = dyn_cast<AllocaInst>(inst)) {
+        Instruction* constness = alloca->clone();
+        builder.Insert(constness);
+        is_const[alloca] = constness;
+        remap_queue.push_back(constness);
         return builder.CreateCall(
           llvm_api.BuildAlloca,
           {get_builder(), emit_type(alloca->getAllocatedType()), get_str("")}
         );
       } else if (LoadInst* load = dyn_cast<LoadInst>(inst)) {
+        Value* constness_ptr = is_const_ptr(load->getPointerOperand());
+        Type* constness_type;
+        if (load->getType()->isPointerTy() || load->getType()->isIntegerTy()) {
+          constness_type = load->getType();
+        } else {
+          assert(false);
+        }
+        is_const[load] = map_pointer_constness(constness_ptr, [&](){
+          return builder.CreateLoad(constness_type, constness_ptr);
+        }, constness_type);
+
         return builder.CreateCall(
           llvm_api.BuildLoad2,
           {
@@ -262,6 +371,15 @@ namespace llmetajit {
           {get_builder(), emit_arg(store->getValueOperand()), emit_arg(store->getPointerOperand())}
         );
       } else if (GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(inst)) {
+        Value* constness_ptr = is_const_ptr(gep->getPointerOperand());
+        is_const[gep] = map_pointer_constness(constness_ptr, [&](){
+          std::vector<Value*> indices;
+          for (Value* index : gep->indices()) {
+            indices.push_back(get_vmap(index));
+          }
+          return builder.CreateGEP(gep->getSourceElementType(), constness_ptr, indices);
+        }, constness_ptr->getType());
+
         std::vector<Value*> indices;
         for (Value* index : gep->indices()) {
           indices.push_back(emit_arg(index));
@@ -278,6 +396,7 @@ namespace llmetajit {
           }
         );
       } else if (CastInst* cast = dyn_cast<CastInst>(inst)) {
+        is_const[cast] = is_const_bool(cast->getOperand(0));
         return builder.CreateCall(
           llvm_api.BuildCast,
           {
@@ -289,6 +408,10 @@ namespace llmetajit {
           }
         );
       } else if (ICmpInst* icmp = dyn_cast<ICmpInst>(inst)) {
+        is_const[icmp] = builder.CreateAnd(
+          is_const_bool(icmp->getOperand(0)),
+          is_const_bool(icmp->getOperand(1))
+        );
         return builder.CreateCall(
           llvm_api.BuildICmp,
           {
@@ -300,6 +423,10 @@ namespace llmetajit {
           }
         );
       } else if (BinaryOperator* binop = dyn_cast<BinaryOperator>(inst)) {
+        is_const[binop] = builder.CreateAnd(
+          is_const_bool(binop->getOperand(0)),
+          is_const_bool(binop->getOperand(1))
+        );
         return builder.CreateCall(
           llvm_api.BuildBinOp,
           {
@@ -311,6 +438,7 @@ namespace llmetajit {
           }
         );
       } else if (CallInst* call = dyn_cast<CallInst>(inst)) {
+        is_const[call] = ConstantInt::getFalse(context);
         std::vector<Value*> args;
         for (Value* arg : call->args()) {
           args.push_back(emit_arg(arg));
@@ -345,7 +473,7 @@ namespace llmetajit {
               {
                 get_builder(),
                 emit_arg(branch->getCondition()),
-                builder.CreateZExt(vmap[branch->getCondition()], Type::getInt32Ty(context))
+                builder.CreateZExt(get_vmap(branch->getCondition()), Type::getInt32Ty(context))
               }
             );
           }
@@ -354,13 +482,39 @@ namespace llmetajit {
           builder.Insert(clone);
         } else {
           builder.Insert(clone);
-          emitted[&inst] = emit_inst(&inst);
+
+          // TODO: Side Effects
+          if (IntegerType* integer_type = dyn_cast<IntegerType>(inst.getType())) {
+            BasicBlock* then = BasicBlock::Create(context, "then", tracer);
+            BasicBlock* otherwise = BasicBlock::Create(context, "otherwise", tracer);
+            BasicBlock* cont = BasicBlock::Create(context, "cont", tracer);
+
+            Value* inst_value = emit_inst(&inst); // TODO: Move into otherwise branch
+
+            builder.CreateCondBr(is_const_bool(&inst), then, otherwise);
+
+            builder.SetInsertPoint(then);
+            Value* constant = emit_constant_int(integer_type, clone);
+            builder.CreateBr(cont);
+
+            builder.SetInsertPoint(otherwise);
+            builder.CreateBr(cont);
+
+            builder.SetInsertPoint(cont);
+            PHINode* phi = builder.CreatePHI(constant->getType(), 2);
+            phi->addIncoming(constant, then);
+            phi->addIncoming(inst_value, otherwise);
+            emitted[&inst] = phi;
+          } else {
+            emitted[&inst] = emit_inst(&inst);
+          }
         }
       }
     }
 
     void gen() {
       llvm_api.setup(tracer->getParent());
+      is_const[interpreter->getArg(0)] = tracer->getArg(1);
 
       for (BasicBlock& block : *interpreter) {
         BasicBlock* new_block = BasicBlock::Create(context, block.getName(), tracer);
@@ -440,6 +594,7 @@ int main(int argc, const char** argv) {
   Function* tracer = Function::Create(
     FunctionType::get(Type::getVoidTy(context), {
       PointerType::get(context, 0), // state
+      PointerType::get(context, 0), // constness
       PointerType::get(context, 0), // builder
       PointerType::get(context, 0), // context
       PointerType::get(context, 0), // function
@@ -504,14 +659,16 @@ int main(int argc, const char** argv) {
 
     using InitFn = void* (*)();
     using StepFn = void (*)(void*);
-    using TraceFn = void (*)(void*, LLVMBuilderRef, LLVMContextRef, LLVMValueRef, LLVMModuleRef);
+    using TraceFn = void (*)(void*, void*, LLVMBuilderRef, LLVMContextRef, LLVMValueRef, LLVMModuleRef);
 
     InitFn init = ExitOnErr(jit->lookup("init")).toPtr<InitFn>();
+    InitFn init_constness = ExitOnErr(jit->lookup("init_constness")).toPtr<InitFn>();
     StepFn step = ExitOnErr(jit->lookup("step")).toPtr<StepFn>();
     TraceFn trace = ExitOnErr(jit->lookup("trace")).toPtr<TraceFn>();
 
     {
       void* state = init();
+      void* constness = init_constness();
       //step(state);
 
 
@@ -530,7 +687,7 @@ int main(int argc, const char** argv) {
       builder.SetInsertPoint(entry);
 
       for (size_t it = 0; it < 30; it++) {
-        trace(state, wrap(&builder), wrap(&context), wrap(my_trace), wrap(trace_module.get()));
+        trace(state, constness, wrap(&builder), wrap(&context), wrap(my_trace), wrap(trace_module.get()));
       }
       builder.CreateRet(nullptr);
 

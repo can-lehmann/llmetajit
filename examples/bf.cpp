@@ -31,6 +31,22 @@ public:
     loop_stack = new size_t[loop_stack_capacity]();
   }
 
+  static uint8_t* constness() {
+    uint8_t* bf = new uint8_t[sizeof(Bf)]();
+
+    size_t code_size = 100;
+    uint8_t* code = new uint8_t[code_size]();
+    for (size_t it = 0; it < code_size; it++) {
+      code[it] = ~uint8_t(0);
+    }
+
+    *(size_t*)&bf[__builtin_offsetof(Bf, pc)] = ~size_t(0);
+    *(size_t*)&bf[__builtin_offsetof(Bf, code_size)] = ~size_t(0);
+    *(uint8_t**)&bf[__builtin_offsetof(Bf, code)] = code;
+
+    return bf;
+  }
+
   void step() {
     if (pc >= code_size) {
       return;
@@ -84,6 +100,10 @@ public:
 extern "C" {
   void* init() {
     return (void*) new Bf();
+  }
+
+  void* init_constness() {
+    return (void*) Bf::constness();
   }
 
   __attribute__((flatten))
