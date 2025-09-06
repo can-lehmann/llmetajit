@@ -486,6 +486,25 @@ namespace llmetajit {
             );
           }
           builder.Insert(clone);
+        } else if (SwitchInst* switch_inst = dyn_cast<SwitchInst>(&inst)) {
+          Value* is_eq = builder.CreateCall(
+            llvm_api.BuildICmp,
+            {
+              get_builder(),
+              get_u((unsigned)ICmpInst::ICMP_EQ),
+              emit_arg(switch_inst->getCondition()),
+              emit_constant_int(
+                cast<IntegerType>(switch_inst->getCondition()->getType()),
+                get_vmap(switch_inst->getCondition())
+              ),
+              get_str("")
+            }
+          );
+          builder.CreateCall(
+            llvm_api.BuildGuard,
+            {get_builder(), is_eq, get_u((LLVMBool)1)}
+          );
+          builder.Insert(clone);
         } else if (ReturnInst* ret = dyn_cast<ReturnInst>(&inst)) {
           builder.Insert(clone);
         } else if (PHINode* phi = dyn_cast<PHINode>(&inst)) {
@@ -628,6 +647,8 @@ int main(int argc, const char** argv) {
 
   LLVMContext context;
   std::unique_ptr<Module> module = parseIRFile(argv[1], diagnostic, context);
+
+  optimize(*module);
 
   Function* interpreter = module->getFunction("step");
   Function* tracer = Function::Create(
