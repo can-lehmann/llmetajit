@@ -334,16 +334,12 @@ namespace llmetajit {
       }
     }
 
-    Value* emit_inst(Instruction* inst) {
+    void gen_is_const(Instruction* inst) {
       if (AllocaInst* alloca = dyn_cast<AllocaInst>(inst)) {
-        Instruction* constness = alloca->clone();
-        builder.Insert(constness);
-        is_const[alloca] = constness;
-        remap_queue.push_back(constness);
-        return builder.CreateCall(
-          llvm_api.BuildAlloca,
-          {get_builder(), emit_type(alloca->getAllocatedType()), get_str("")}
-        );
+        Instruction* clone = alloca->clone();
+        builder.Insert(clone);
+        is_const[alloca] = clone;
+        remap_queue.push_back(clone);
       } else if (LoadInst* load = dyn_cast<LoadInst>(inst)) {
         Value* constness_ptr = is_const_ptr(load->getPointerOperand());
         Type* constness_type;
@@ -355,7 +351,34 @@ namespace llmetajit {
         is_const[load] = map_pointer_constness(constness_ptr, [&](){
           return builder.CreateLoad(constness_type, constness_ptr);
         }, constness_type);
+      } else if (GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(inst)) {
+        Value* constness_ptr = is_const_ptr(gep->getPointerOperand());
+        is_const[gep] = map_pointer_constness(constness_ptr, [&](){
+          std::vector<Value*> indices;
+          for (Value* index : gep->indices()) {
+            indices.push_back(get_vmap(index));
+          }
+          return builder.CreateGEP(gep->getSourceElementType(), constness_ptr, indices);
+        }, constness_ptr->getType());
+      } else if (CastInst* cast = dyn_cast<CastInst>(inst)) {
+        is_const[cast] = is_const_bool(cast->getOperand(0));
+      } else if (isa<ICmpInst>(inst) || isa<BinaryOperator>(inst)) {
+        is_const[inst] = builder.CreateAnd(
+          is_const_bool(inst->getOperand(0)),
+          is_const_bool(inst->getOperand(1))
+        );
+      } else {
+        is_const[inst] = ConstantInt::getFalse(context);
+      }
+    }
 
+    Value* emit_inst(Instruction* inst) {
+      if (AllocaInst* alloca = dyn_cast<AllocaInst>(inst)) {
+        return builder.CreateCall(
+          llvm_api.BuildAlloca,
+          {get_builder(), emit_type(alloca->getAllocatedType()), get_str("")}
+        );
+      } else if (LoadInst* load = dyn_cast<LoadInst>(inst)) {
         return builder.CreateCall(
           llvm_api.BuildLoad2,
           {
@@ -371,15 +394,6 @@ namespace llmetajit {
           {get_builder(), emit_arg(store->getValueOperand()), emit_arg(store->getPointerOperand())}
         );
       } else if (GetElementPtrInst* gep = dyn_cast<GetElementPtrInst>(inst)) {
-        Value* constness_ptr = is_const_ptr(gep->getPointerOperand());
-        is_const[gep] = map_pointer_constness(constness_ptr, [&](){
-          std::vector<Value*> indices;
-          for (Value* index : gep->indices()) {
-            indices.push_back(get_vmap(index));
-          }
-          return builder.CreateGEP(gep->getSourceElementType(), constness_ptr, indices);
-        }, constness_ptr->getType());
-
         std::vector<Value*> indices;
         for (Value* index : gep->indices()) {
           indices.push_back(emit_arg(index));
@@ -396,7 +410,6 @@ namespace llmetajit {
           }
         );
       } else if (CastInst* cast = dyn_cast<CastInst>(inst)) {
-        is_const[cast] = is_const_bool(cast->getOperand(0));
         return builder.CreateCall(
           llvm_api.BuildCast,
           {
@@ -408,10 +421,6 @@ namespace llmetajit {
           }
         );
       } else if (ICmpInst* icmp = dyn_cast<ICmpInst>(inst)) {
-        is_const[icmp] = builder.CreateAnd(
-          is_const_bool(icmp->getOperand(0)),
-          is_const_bool(icmp->getOperand(1))
-        );
         return builder.CreateCall(
           llvm_api.BuildICmp,
           {
@@ -423,10 +432,6 @@ namespace llmetajit {
           }
         );
       } else if (BinaryOperator* binop = dyn_cast<BinaryOperator>(inst)) {
-        is_const[binop] = builder.CreateAnd(
-          is_const_bool(binop->getOperand(0)),
-          is_const_bool(binop->getOperand(1))
-        );
         return builder.CreateCall(
           llvm_api.BuildBinOp,
           {
@@ -438,7 +443,6 @@ namespace llmetajit {
           }
         );
       } else if (CallInst* call = dyn_cast<CallInst>(inst)) {
-        is_const[call] = ConstantInt::getFalse(context);
         std::vector<Value*> args;
         for (Value* arg : call->args()) {
           args.push_back(emit_arg(arg));
@@ -489,8 +493,7 @@ namespace llmetajit {
             BasicBlock* otherwise = BasicBlock::Create(context, "otherwise", tracer);
             BasicBlock* cont = BasicBlock::Create(context, "cont", tracer);
 
-            Value* inst_value = emit_inst(&inst); // TODO: Move into otherwise branch
-
+            gen_is_const(&inst);
             builder.CreateCondBr(is_const_bool(&inst), then, otherwise);
 
             builder.SetInsertPoint(then);
@@ -498,6 +501,7 @@ namespace llmetajit {
             builder.CreateBr(cont);
 
             builder.SetInsertPoint(otherwise);
+            Value* inst_value = emit_inst(&inst);
             builder.CreateBr(cont);
 
             builder.SetInsertPoint(cont);
@@ -506,6 +510,7 @@ namespace llmetajit {
             phi->addIncoming(inst_value, otherwise);
             emitted[&inst] = phi;
           } else {
+            gen_is_const(&inst);
             emitted[&inst] = emit_inst(&inst);
           }
         }
