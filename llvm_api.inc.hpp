@@ -20,6 +20,7 @@ llvm_func(BuildCast, value_ptr, builder_ptr, opcode, value_ptr, type_ptr, ptr)
 llvm_func(BuildICmp, value_ptr, builder_ptr, u, value_ptr, type_ptr, ptr)
 llvm_func(BuildRetVoid, value_ptr, builder_ptr)
 llvm_func(BuildCall2, value_ptr, builder_ptr, type_ptr, value_ptr, value_ptr_ptr, u, ptr)
+llvm_func(BuildPhi, value_ptr, builder_ptr, type_ptr, ptr)
 
 llvm_func(GetNamedFunction, value_ptr, module_ptr, ptr)
 

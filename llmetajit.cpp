@@ -48,11 +48,15 @@ namespace llmetajit {
     Function* tracer;
 
     IRBuilder<> builder;
-    ValueToValueMapTy vmap;
-    std::vector<Instruction*> remap_queue;
     std::map<BasicBlock*, BasicBlock*> blocks;
+    std::map<BasicBlock*, BasicBlock*> end_blocks;
     std::map<Value*, Value*> is_const;
     std::map<Value*, Value*> emitted;
+
+    ValueToValueMapTy vmap;
+    std::vector<Instruction*> remap_queue;
+    std::vector<std::tuple<PHINode*, PHINode*, PHINode*>> phi_queue;
+
     size_t string_id = 0;
 
     struct LLVM_API {
@@ -484,6 +488,19 @@ namespace llmetajit {
           builder.Insert(clone);
         } else if (ReturnInst* ret = dyn_cast<ReturnInst>(&inst)) {
           builder.Insert(clone);
+        } else if (PHINode* phi = dyn_cast<PHINode>(&inst)) {
+          builder.Insert(clone);
+          PHINode* constness_phi = builder.CreatePHI(
+            Type::getInt1Ty(context),
+            phi->getNumIncomingValues()
+          );
+          PHINode* emitted_phi = builder.CreatePHI(
+            PointerType::get(context, 0),
+            phi->getNumIncomingValues()
+          );
+          phi_queue.emplace_back(phi, emitted_phi, constness_phi);
+          is_const[phi] = constness_phi;
+          emitted[phi] = emitted_phi;
         } else {
           builder.Insert(clone);
 
@@ -515,6 +532,7 @@ namespace llmetajit {
           }
         }
       }
+      end_blocks[block] = builder.GetInsertBlock();
     }
 
     void gen() {
@@ -527,8 +545,19 @@ namespace llmetajit {
         vmap[&block] = new_block;
       }
 
-      for (BasicBlock& block : *interpreter) {
-        gen(&block);
+      DominatorTree dominator_tree(*interpreter);
+      for (const DomTreeNode* node : depth_first(dominator_tree.getRootNode())) {
+        gen(node->getBlock());
+      }
+
+      for (const auto& [phi, emitted_phi, constness_phi] : phi_queue) {
+        for (unsigned it = 0; it < phi->getNumIncomingValues(); it++) {
+          BasicBlock* end_block = end_blocks.at(phi->getIncomingBlock(it));
+          Value* value = phi->getIncomingValue(it);
+          builder.SetInsertPoint(end_block->getTerminator());
+          emitted_phi->addIncoming(emit_arg(value), end_block);
+          constness_phi->addIncoming(is_const_bool(value), end_block);
+        }
       }
 
       for (size_t it = 0; it < interpreter->arg_size(); it++) {
@@ -536,6 +565,11 @@ namespace llmetajit {
       }
 
       for (Instruction* inst : remap_queue) {
+        if (PHINode* phi = dyn_cast<PHINode>(inst)) {
+          for (unsigned it = 0; it < phi->getNumIncomingValues(); it++) {
+            phi->setIncomingBlock(it, end_blocks.at(phi->getIncomingBlock(it)));
+          }
+        }
         RemapInstruction(inst, vmap);
       }
     }
